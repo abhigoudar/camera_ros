@@ -45,7 +45,7 @@ format_result(const std::vector<std::string> &msgs)
 }
 
 ParameterHandler::ParameterHandler(rclcpp::Node *const node)
-    : node(node), parameter_conflict_handler()
+    : node(node)
 {
   param_cb_on = node->add_on_set_parameters_callback(
     std::bind(&ParameterHandler::OnSetValidate, this, std::placeholders::_1));
@@ -70,6 +70,11 @@ ParameterHandler::declare(const libcamera::ControlInfoMap &controls)
   // All "control" parameters are declared as dynamically typed in order to be able
   // to unset them (set their type to 'rclcpp::ParameterType::PARAMETER_NOT_SET').
   // Unsetting a statically typed parameter causes "cannot undeclare a statically typed parameter".
+
+  if (controls.empty()) {
+    RCLCPP_DEBUG_STREAM(node->get_logger(), "No controls to declare.");
+    return;
+  }
 
   ParameterConflictHandler::ParameterValueMap parameters;
   for (const auto &[id, info] : controls) {

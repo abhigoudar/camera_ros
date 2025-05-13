@@ -1,5 +1,6 @@
 #include "ParameterHandler.hpp"
 #include "format_mapping.hpp"
+#include "libcamera_version_utils.hpp"
 #include "pretty_print.hpp"
 #include <algorithm>
 #include <camera_info_manager/camera_info_manager.hpp>
@@ -47,6 +48,7 @@
 #include <rclcpp/publisher.hpp>
 #include <rclcpp/time.hpp>
 #include <rclcpp_components/register_node_macro.hpp>
+#include <regex>
 #include <sensor_msgs/image_encodings.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/compressed_image.hpp>
@@ -150,6 +152,35 @@ get_role(const std::string &role)
   }
 }
 
+libcamera::Size
+get_sensor_format(const std::string &format_str)
+{
+  if (format_str.empty()) {
+    return {};
+  }
+
+  const std::regex pattern(R"((\d+):(\d+))");
+  std::smatch match;
+
+  if (std::regex_match(format_str, match, pattern)) {
+    try {
+      const int width = std::stoi(match[1].str());
+      const int height = std::stoi(match[2].str());
+
+      return libcamera::Size {static_cast<unsigned int>(width), static_cast<unsigned int>(height)};
+    }
+    catch (const std::out_of_range &) {
+      throw std::runtime_error("Invalid sensor_mode. Width or height exceeds maximum value of " +
+                               std::to_string(std::numeric_limits<int>::max()));
+    }
+    catch (const std::invalid_argument &) {
+      // Unexpected - throw exception below
+    }
+  }
+
+  // Throw exception as it was not possible to parse the format string
+  throw std::runtime_error("Invalid sensor_mode. Expected [width]:[height] but got " + format_str);
+}
 
 // The following function "compressImageMsg" is adapted from "CvImage::toCompressedImageMsg"
 // (https://github.com/ros-perception/vision_opencv/blob/066793a23e5d06d76c78ca3d69824a501c3554fd/cv_bridge/src/cv_bridge.cpp#L512-L535)
@@ -221,13 +252,34 @@ CameraNode::CameraNode(const rclcpp::NodeOptions &options)
   const uint32_t h = declare_parameter<int64_t>("height", {}, param_descr_ro);
   const libcamera::Size size {w, h};
 
+  // Raw format dimensions
+  rcl_interfaces::msg::ParameterDescriptor param_descr_sensor_mode;
+  param_descr_sensor_mode.description = "raw mode of the sensor";
+  param_descr_sensor_mode.additional_constraints = "string in format [width]:[height]";
+  param_descr_sensor_mode.read_only = true;
+  const libcamera::Size sensor_size = get_sensor_format(declare_parameter<std::string>("sensor_mode", {}, param_descr_sensor_mode));
+
+#if LIBCAMERA_VER_GE(0, 2, 0)
+  rcl_interfaces::msg::ParameterDescriptor param_descr_orientation;
+  param_descr_orientation.description = "camera orientation";
+  rcl_interfaces::msg::IntegerRange orientation_range;
+  orientation_range.from_value = 0;
+  orientation_range.to_value = 270;
+  orientation_range.step = 90;
+  param_descr_orientation.integer_range.push_back(orientation_range);
+  param_descr_orientation.read_only = true;
+  const libcamera::Orientation orientation = libcamera::orientationFromRotation(
+    declare_parameter<int>("orientation", 0, param_descr_orientation));
+#endif
+
   // camera info file url
   rcl_interfaces::msg::ParameterDescriptor param_descr_camera_info_url;
   param_descr_camera_info_url.description = "camera calibration info file url";
   param_descr_camera_info_url.read_only = true;
 
   // camera ID
-  declare_parameter("camera", rclcpp::ParameterValue {}, param_descr_ro.set__dynamic_typing(true));
+  const rclcpp::ParameterValue &camera_id =
+    declare_parameter("camera", rclcpp::ParameterValue {}, param_descr_ro.set__dynamic_typing(true));
 
   // we cannot control the compression rate of the libcamera MJPEG stream
   // ignore "jpeg_quality" parameter for MJPEG streams
@@ -258,7 +310,7 @@ CameraNode::CameraNode(const rclcpp::NodeOptions &options)
     throw std::runtime_error("no cameras available");
 
   // get the camera
-  switch (get_parameter("camera").get_type()) {
+  switch (camera_id.get_type()) {
   case rclcpp::ParameterType::PARAMETER_NOT_SET:
     // use first camera as default
     camera = camera_manager.cameras().front();
@@ -269,7 +321,7 @@ CameraNode::CameraNode(const rclcpp::NodeOptions &options)
     break;
   case rclcpp::ParameterType::PARAMETER_INTEGER:
   {
-    const size_t id = get_parameter("camera").as_int();
+    const size_t &id = camera_id.get<rclcpp::ParameterType::PARAMETER_INTEGER>();
     if (id >= camera_manager.cameras().size()) {
       RCLCPP_INFO_STREAM(get_logger(), camera_manager);
       throw std::runtime_error("camera with id " + std::to_string(id) + " does not exist");
@@ -279,7 +331,7 @@ CameraNode::CameraNode(const rclcpp::NodeOptions &options)
   } break;
   case rclcpp::ParameterType::PARAMETER_STRING:
   {
-    const std::string name = get_parameter("camera").as_string();
+    const std::string &name = camera_id.get<rclcpp::ParameterType::PARAMETER_STRING>();
     camera = camera_manager.get(name);
     if (!camera) {
       RCLCPP_INFO_STREAM(get_logger(), camera_manager);
@@ -288,8 +340,8 @@ CameraNode::CameraNode(const rclcpp::NodeOptions &options)
     RCLCPP_DEBUG_STREAM(get_logger(), "found camera by name: \"" << name << "\"");
   } break;
   default:
-    RCLCPP_ERROR_STREAM(get_logger(), "unsupported camera parameter type: "
-                                        << get_parameter("camera").get_type_name());
+    RCLCPP_FATAL_STREAM(get_logger(), "unsupported camera parameter type: "
+                                        << rclcpp::to_string(camera_id.get_type()));
     break;
   }
 
@@ -299,14 +351,24 @@ CameraNode::CameraNode(const rclcpp::NodeOptions &options)
   if (camera->acquire())
     throw std::runtime_error("failed to acquire camera");
 
+  std::vector<libcamera::StreamRole> roles {role};
+
+  // Add the RAW role if the sensor_size is defined
+  if (!sensor_size.isNull() && role != libcamera::StreamRole::Raw) {
+    roles.push_back(libcamera::StreamRole::Raw);
+  }
+
   // configure camera stream
   std::unique_ptr<libcamera::CameraConfiguration> cfg =
-    camera->generateConfiguration({role});
+    camera->generateConfiguration(roles);
 
-  if (!cfg)
-    throw std::runtime_error("failed to generate configuration");
+  if (!cfg || cfg->size() != roles.size())
+    throw std::runtime_error("failed to generate configuration for all roles");
 
-  assert(cfg->size() == 1);
+#if LIBCAMERA_VER_GE(0, 2, 0)
+  cfg->orientation = orientation;
+#endif
+
   libcamera::StreamConfiguration &scfg = cfg->at(0);
 
   // list all camera formats, including those not supported by the ROS message
@@ -357,6 +419,12 @@ CameraNode::CameraNode(const rclcpp::NodeOptions &options)
     scfg.size = size;
   }
 
+  if (!sensor_size.isNull() && role != libcamera::StreamRole::Raw) {
+    libcamera::StreamConfiguration &modecfg = cfg->at(1);
+    modecfg.size = sensor_size;
+    RCLCPP_INFO_STREAM(get_logger(), "Sensor mode configuration: " << modecfg.toString());
+  }
+
   // store selected stream configuration
   const libcamera::StreamConfiguration selected_scfg = scfg;
 
@@ -364,9 +432,18 @@ CameraNode::CameraNode(const rclcpp::NodeOptions &options)
   case libcamera::CameraConfiguration::Valid:
     break;
   case libcamera::CameraConfiguration::Adjusted:
+#if LIBCAMERA_VER_GE(0, 2, 0)
+    RCLCPP_WARN_STREAM(get_logger(), "stream configuration adjusted from \""
+                                       << selected_scfg.toString() << "\" (" << orientation << ") to \"" << scfg.toString()
+                                       << "\" (" << cfg->orientation << ")");
+    if (cfg->orientation != orientation) {
+      RCLCPP_WARN_STREAM(get_logger(), "cannot set orientation to " << orientation);
+    }
+#else
     RCLCPP_WARN_STREAM(get_logger(), "stream configuration adjusted from \""
                                        << selected_scfg.toString() << "\" to \"" << scfg.toString()
                                        << "\"");
+#endif
     break;
   case libcamera::CameraConfiguration::Invalid:
     throw std::runtime_error("failed to validate stream configurations");
@@ -392,6 +469,8 @@ CameraNode::CameraNode(const rclcpp::NodeOptions &options)
   const std::optional<std::string> model = props.get(libcamera::properties::Model);
   if (model)
     cname = model.value() + '_' + cname;
+  if (!sensor_size.isNull() && role != libcamera::StreamRole::Raw)
+    cname = cname + '_' + cfg->at(1).toString();
 
   // clean camera name of non-alphanumeric characters
   cname.erase(
